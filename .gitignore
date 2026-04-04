@@ -1,0 +1,23 @@
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.map
+
+# Arduino IDE
+.vs/
+.vscode/
+*.bak
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets — never commit your real credentials
+secrets.h
