@@ -1,4 +1,4 @@
-# 🐾 Hati Tracker — Firmware
+# 🐾 Hati Tracker Firmware
 
 GPS tracker firmware for the **LilyGO T-A7670E** ESP32 board.
 Built for tracking a dog (Hati, an Australian Cattle Dog) during canicross runs.
@@ -136,8 +136,3 @@ Watchdog: auto-restart if board hangs > 2 minutes
 - [`hati-tracker-backend`](https://github.com/yourusername/hati-tracker-backend) — Traccar server on Docker
 - [`hati-tracker-dashboard`](https://github.com/yourusername/hati-tracker-dashboard) — React/TypeScript canicross stats dashboard
 
----
-
-## License
-
-MIT
