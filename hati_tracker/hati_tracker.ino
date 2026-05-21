@@ -1,377 +1,643 @@
 // ============================================================
-// Hati Tracker — LilyGO T-A7670E
-// Finland | GPS+GLONASS+Galileo | Telia 4G | Traccar
-// Walk: 5s updates | Run (>6km/h): 1s updates
+// Hati Tracker — LilyGO T-A7670E / A7670E
+// GNSS via AT+CGNSSINFO + AGPS via AT+CAGPS + Traccar OsmAnd
+//
+// Safe-to-commit version:
+//   - Put private server/device/APN values in secrets.h
+//   - Commit secrets.example.h, not secrets.h
+//
+// LED STATUS:
+//   RED1 GPIO 12
+//     - Blinks while booting / connecting 4G
+//     - Solid ON when 4G is connected
+//
+//   RED2 GPIO 2
+//     - OFF before GNSS search starts
+//     - Blinks while searching GNSS fix
+//     - Solid ON when GNSS fix is valid
+//
+// When everything works: both LEDs are solid ON.
 // ============================================================
 
 #define TINY_GSM_MODEM_SIM7600
+
 #include <TinyGsmClient.h>
 #include <ArduinoHttpClient.h>
 #include <esp_task_wdt.h>
+#include <ctype.h>
+#include <math.h>
+#include "secrets.h"
 
-// ---- PINS --------------------------------------------------
+// ---- MODEM PINS --------------------------------------------
 #define MODEM_TX        26
 #define MODEM_RX        27
 #define MODEM_PWRKEY    4
 #define MODEM_POWER_ON  25
 #define MODEM_RST       5
 #define BAT_ADC         35
-#define LED_PIN         12
 
-// ---- NETWORK -----------------------------------------------
-const char APN[]  = "internet";
-const char USER[] = "";
-const char PASS[] = "";
+// ---- LED PINS ----------------------------------------------
+#define LED_RED1        12
+#define LED_RED2        2
 
-// ---- TRACCAR -----------------------------------------------
-const char TRACCAR_HOST[] = "demo.traccar.org";
-const int  TRACCAR_PORT   = 5055;
-const char DEVICE_ID[]    = "hati-tracker-001";
+// ---- DEBUG --------------------------------------------------
+#define DEBUG_SERIAL    1
+
+#if DEBUG_SERIAL
+  #define LOG(x)        Serial.print(x)
+  #define LOGLN(x)      Serial.println(x)
+  #define LOGF(...)     Serial.printf(__VA_ARGS__)
+#else
+  #define LOG(x)
+  #define LOGLN(x)
+  #define LOGF(...)
+#endif
 
 // ---- TIMING ------------------------------------------------
-const unsigned long GPS_TIMEOUT_MS      = 90000; // 90s to get fix
-const unsigned long GPS_POLL_MS         = 500;   // check every 0.5s
-const float         SPEED_THRESHOLD_KMH = 6.0;  // walk vs run
-const unsigned long INTERVAL_WALK_MS    = 5000;  // 5s walking
-const unsigned long INTERVAL_RUN_MS     = 1000;  // 1s running
+const unsigned long GPS_SEARCH_TIMEOUT_MS = 300000;  // 5 min max search window
+const unsigned long GPS_POLL_MS           = 1000;    // read CGNSSINFO every 1s
+const unsigned long WALK_INTERVAL_MS      = 5000;
+const unsigned long RUN_INTERVAL_MS       = 1000;
+const unsigned long MIN_SEND_INTERVAL_MS  = 900;
+const unsigned long RED1_BLINK_MS         = 500;
+const unsigned long RED2_BLINK_MS         = 1000;
+
+const float RUN_THRESHOLD_KMH = 6.0;
+
+// ---- BATTERY -----------------------------------------------
+// On USB-only power this may read 0. Disable until board battery ADC is verified.
+const bool  ENABLE_BATTERY_ADC = false;
+const float BATTERY_DIVIDER    = 2.0;
+const float BATTERY_CAL        = 1.00;
 
 // ---- GLOBALS -----------------------------------------------
 HardwareSerial modemSerial(1);
 TinyGsm        modem(modemSerial);
 TinyGsmClient  gsmClient(modem);
-int            failCount = 0;
+
+bool has4G            = false;
+bool gpsSearchStarted = false;
+bool hasGPSFix        = false;
+
+unsigned long lastSendMs    = 0;
+unsigned long lastRed1Blink = 0;
+unsigned long lastRed2Blink = 0;
+bool red1State = false;
+bool red2State = false;
+int  failCount = 0;
+
+struct GpsFix {
+  float lat = 0;
+  float lon = 0;
+  float speedKmh = 0;
+  float altitude = 0;
+  float accuracy = 50;
+  int visibleSats = 0;
+  int usedSats = 0;
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  bool valid = false;
+};
+
+// ============================================================
+void setLED(int pin, bool on) {
+  digitalWrite(pin, on ? HIGH : LOW);
+}
+
+void updateLEDs() {
+  unsigned long now = millis();
+
+  if (has4G) {
+    red1State = true;
+    setLED(LED_RED1, true);
+  } else if (now - lastRed1Blink >= RED1_BLINK_MS) {
+    red1State = !red1State;
+    setLED(LED_RED1, red1State);
+    lastRed1Blink = now;
+  }
+
+  if (!gpsSearchStarted) {
+    red2State = false;
+    setLED(LED_RED2, false);
+  } else if (hasGPSFix) {
+    red2State = true;
+    setLED(LED_RED2, true);
+  } else if (now - lastRed2Blink >= RED2_BLINK_MS) {
+    red2State = !red2State;
+    setLED(LED_RED2, red2State);
+    lastRed2Blink = now;
+  }
+}
+
+void delayWithTasks(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    esp_task_wdt_reset();
+    updateLEDs();
+    delay(50);
+  }
+}
+
+// ============================================================
+void setupWatchdog() {
+  esp_task_wdt_config_t wdt = {
+    .timeout_ms     = 180000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic  = true
+  };
+
+  esp_err_t result = esp_task_wdt_init(&wdt);
+  if (result == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&wdt);
+  }
+  esp_task_wdt_add(NULL);
+}
+
+// ============================================================
+String sendAT(const char* cmd, unsigned long waitMs, bool echo = true) {
+  while (modemSerial.available()) modemSerial.read();
+  modemSerial.println(cmd);
+
+  String resp;
+  unsigned long start = millis();
+  while (millis() - start < waitMs) {
+    while (modemSerial.available()) resp += (char)modemSerial.read();
+    esp_task_wdt_reset();
+    updateLEDs();
+    delay(10);
+  }
+
+#if DEBUG_SERIAL
+  if (echo) {
+    LOGLN();
+    LOG("CMD: "); LOGLN(cmd);
+    LOG("RESP: "); LOGLN(resp.length() ? resp : "(no response)");
+    LOGLN("----");
+  }
+#endif
+
+  return resp;
+}
+
+String urlEncode(const char* str) {
+  String enc;
+  char buf[4];
+  while (*str) {
+    char c = *str++;
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      enc += c;
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      enc += buf;
+    }
+  }
+  return enc;
+}
+
+// ============================================================
+void powerOnModem() {
+  LOGLN("Powering on modem...");
+
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  pinMode(MODEM_RST, OUTPUT);
+
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  digitalWrite(MODEM_RST, HIGH);
+  delay(100);
+
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(1200);
+  digitalWrite(MODEM_PWRKEY, LOW);
+
+  // A7670E sometimes needs more than 8 seconds before AT responds.
+  delayWithTasks(15000);
+  LOGLN("Modem power sequence done.");
+}
+
+bool waitForModem() {
+  LOG("Sync modem");
+
+  for (int i = 0; i < 40; i++) {
+    String resp = sendAT("AT", 500, false);
+    if (resp.indexOf("OK") >= 0) {
+      LOGLN(" OK!");
+      return true;
+    }
+    LOG(".");
+    delayWithTasks(250);
+  }
+
+  LOGLN(" FAILED");
+  return false;
+}
+
+bool connect4G() {
+  LOG("Network");
+
+  for (int i = 0; i < 20; i++) {
+    if (modem.waitForNetwork(10000L)) {
+      LOGLN(" OK");
+      break;
+    }
+    LOG(".");
+    if (i == 19) {
+      LOGLN(" FAILED");
+      return false;
+    }
+    esp_task_wdt_reset();
+    updateLEDs();
+  }
+
+  LOG("Operator: "); LOGLN(modem.getOperator());
+  LOG("Signal:   "); LOGLN(modem.getSignalQuality());
+
+  LOG("APN...");
+  if (!modem.gprsConnect(APN, APN_USER, APN_PASS)) {
+    LOGLN(" FAILED");
+    return false;
+  }
+
+  has4G = true;
+  updateLEDs();
+
+  LOG(" OK  IP: "); LOGLN(modem.localIP());
+  return true;
+}
+
+// ============================================================
+bool waitGnssReady(unsigned long timeoutMs) {
+  LOGLN("Waiting for GNSS READY...");
+
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (modemSerial.available()) {
+      String line = modemSerial.readStringUntil('\n');
+      line.trim();
+      if (line.length()) {
+        LOG("GNSS async: "); LOGLN(line);
+      }
+      if (line.indexOf("+CGNSSPWR: READY") >= 0) {
+        LOGLN("GNSS READY received.");
+        return true;
+      }
+    }
+    delayWithTasks(100);
+  }
+
+  LOGLN("GNSS READY not seen, continuing anyway.");
+  return false;
+}
+
+void tryAGPS() {
+  if (!modem.isGprsConnected()) {
+    has4G = false;
+    updateLEDs();
+    if (!modem.gprsConnect(APN, APN_USER, APN_PASS)) {
+      LOGLN("AGPS skipped: GPRS reconnect failed.");
+      return;
+    }
+    has4G = true;
+    updateLEDs();
+  }
+
+  LOGLN("AGPS: AT+CAGPS...");
+  String r = sendAT("AT+CAGPS", 12000);
+
+  if (r.indexOf("+AGPS: success") >= 0) {
+    LOGLN("AGPS: success.");
+  } else if (r.indexOf("+AGPS:") >= 0) {
+    LOGLN("AGPS: returned status/error.");
+  } else if (r.indexOf("ERROR") >= 0) {
+    LOGLN("AGPS: unsupported/failed.");
+  } else {
+    LOGLN("AGPS: no clear response.");
+  }
+}
+
+void setupGNSS() {
+  LOGLN();
+  LOGLN("--- GNSS Setup ---");
+
+  sendAT("AT+CGNSSPWR?", 1000);
+  sendAT("AT+CGNSSPWR=0", 1000);
+  delayWithTasks(1000);
+
+  // Do not use AT+CGNSSMODE=11. This firmware returned ERROR for it.
+  sendAT("AT+CGNSSPWR=1", 2000);
+  waitGnssReady(30000);
+  sendAT("AT+CGNSSPWR?", 1000);
+
+  // Confirm command path. Product line may arrive with this response.
+  sendAT("AT+CGNSSINFO", 3000);
+
+  // This works on your A7670E and significantly improved first fix.
+  tryAGPS();
+
+  sendAT("AT+CGNSSINFO", 3000);
+
+  LOGLN("--- GNSS Setup done ---");
+  LOGLN();
+}
+
+// ============================================================
+bool parseCGNSSINFO(const String &resp, GpsFix &fix) {
+  int p = resp.indexOf("+CGNSSINFO:");
+  if (p < 0) return false;
+
+  int start = p + strlen("+CGNSSINFO:");
+  int end = resp.indexOf('\n', start);
+  if (end < 0) end = resp.indexOf('\r', start);
+  if (end < 0) end = resp.length();
+
+  String line = resp.substring(start, end);
+  line.trim();
+
+  if (line.length() == 0 || line.startsWith(",,,,") || line.indexOf(",,,,") >= 0) {
+    return false;
+  }
+
+  String f[24];
+  int count = 0;
+  int fieldStart = 0;
+
+  while (count < 24) {
+    int comma = line.indexOf(',', fieldStart);
+    if (comma < 0) {
+      f[count++] = line.substring(fieldStart);
+      break;
+    }
+    f[count++] = line.substring(fieldStart, comma);
+    fieldStart = comma + 1;
+  }
+
+  if (count < 13 || f[5].length() == 0 || f[7].length() == 0) {
+    return false;
+  }
+
+  fix.lat = f[5].toFloat();
+  fix.lon = f[7].toFloat();
+  if (f[6] == "S") fix.lat = -fix.lat;
+  if (f[8] == "W") fix.lon = -fix.lon;
+
+  if (!(fix.lat > 59.0 && fix.lat < 71.0 && fix.lon > 19.0 && fix.lon < 32.0)) {
+    return false;
+  }
+
+  String date = f[9];   // ddmmyy
+  String time = f[10];  // hhmmss.ss
+
+  if (date.length() >= 6) {
+    fix.day   = date.substring(0, 2).toInt();
+    fix.month = date.substring(2, 4).toInt();
+    fix.year  = 2000 + date.substring(4, 6).toInt();
+  }
+
+  if (time.length() >= 6) {
+    fix.hour   = time.substring(0, 2).toInt();
+    fix.minute = time.substring(2, 4).toInt();
+    fix.second = time.substring(4, 6).toInt();
+  }
+
+  fix.altitude = f[11].toFloat();
+  fix.speedKmh = f[12].toFloat();
+
+  fix.visibleSats = f[1].toInt();
+  int usedA = f[3].toInt();
+  int usedB = f[4].toInt();
+  fix.usedSats = usedA > usedB ? usedA : usedB;
+  if (fix.usedSats <= 0 && fix.visibleSats > 0) fix.usedSats = fix.visibleSats;
+
+  // Use a DOP-like field as rough accuracy estimate.
+  if (count > 15) {
+    float dop = f[15].toFloat();
+    fix.accuracy = dop > 0 ? dop * 5.0 : 50.0;
+  } else {
+    fix.accuracy = 50.0;
+  }
+
+  if (fix.accuracy <= 0 || isnan(fix.accuracy) || fix.accuracy > 9999) {
+    fix.accuracy = 50.0;
+  }
+
+  fix.valid = true;
+  return true;
+}
+
+bool readGpsFix(GpsFix &fix) {
+  String resp = sendAT("AT+CGNSSINFO", 1500, DEBUG_SERIAL);
+  return parseCGNSSINFO(resp, fix);
+}
+
+// ============================================================
+float readBatteryPercent() {
+  if (!ENABLE_BATTERY_ADC) return 100.0;
+
+  int r[20];
+  for (int i = 0; i < 20; i++) {
+    r[i] = analogRead(BAT_ADC);
+    delay(5);
+  }
+
+  for (int i = 0; i < 19; i++) {
+    for (int j = i + 1; j < 20; j++) {
+      if (r[j] < r[i]) {
+        int tmp = r[i];
+        r[i] = r[j];
+        r[j] = tmp;
+      }
+    }
+  }
+
+  long sum = 0;
+  for (int i = 5; i < 15; i++) sum += r[i];
+
+  float v = (sum / 10.0 / 4095.0) * 3.3 * BATTERY_DIVIDER * BATTERY_CAL;
+  return constrain(((v - 3.0) / (4.2 - 3.0)) * 100.0, 0.0, 100.0);
+}
+
+// ============================================================
+bool sendToTraccar(const GpsFix &fix) {
+  if (!modem.isGprsConnected()) {
+    LOGLN("GPRS reconnect...");
+    has4G = false;
+    updateLEDs();
+
+    if (!modem.gprsConnect(APN, APN_USER, APN_PASS)) {
+      LOGLN("GPRS reconnect failed.");
+      return false;
+    }
+
+    has4G = true;
+    updateLEDs();
+    delayWithTasks(3000);
+  }
+
+  float batt = readBatteryPercent();
+  int battInt = constrain((int)round(batt), 0, 100);
+
+  // Traccar OsmAnd speed is commonly interpreted as knots.
+  // A7670E CGNSSINFO speed appears to be km/h from your train test.
+  float speedKnots = fix.speedKmh * 0.539957;
+
+  float accuracy = fix.accuracy;
+  if (accuracy <= 0 || isnan(accuracy) || accuracy > 9999) accuracy = 50.0;
+
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           fix.year, fix.month, fix.day,
+           fix.hour, fix.minute, fix.second);
+
+  String path = "/?id=";
+  path += DEVICE_ID;
+  path += "&lat=";        path += String(fix.lat, 6);
+  path += "&lon=";        path += String(fix.lon, 6);
+  path += "&speed=";      path += String(speedKnots, 2);
+  path += "&altitude=";   path += String(fix.altitude, 1);
+  path += "&batt=";       path += String(battInt);
+  path += "&satellites="; path += String(fix.usedSats);
+  path += "&accuracy=";   path += String(accuracy, 1);
+  path += "&valid=true";
+  path += "&timestamp=";  path += urlEncode(ts);
+
+  LOG("Traccar GET "); LOGLN(path);
+
+  HttpClient http(gsmClient, TRACCAR_HOST, TRACCAR_PORT);
+  http.setTimeout(15000);
+
+  int err = http.get(path);
+  if (err != 0) {
+    LOG("Traccar client err "); LOGLN(err);
+    http.stop();
+    return false;
+  }
+
+  int status = http.responseStatusCode();
+  LOG("Traccar HTTP "); LOGLN(status);
+  http.stop();
+
+  return status >= 200 && status < 300;
+}
 
 // ============================================================
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n==============================");
-  Serial.println("     Hati Tracker Booting");
-  Serial.println("==============================");
 
-  // Watchdog — restart if hung >3 min
-  esp_task_wdt_config_t wdt = {
-    .timeout_ms     = 180000,
-    .idle_core_mask = 0,
-    .trigger_panic  = true
-  };
-  esp_task_wdt_reconfigure(&wdt);
-  esp_task_wdt_add(NULL);
+  LOGLN();
+  LOGLN("==============================");
+  LOGLN("     Hati Tracker Booting");
+  LOGLN("==============================");
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  pinMode(LED_RED1, OUTPUT);
+  pinMode(LED_RED2, OUTPUT);
+  setLED(LED_RED1, false);
+  setLED(LED_RED2, false);
 
-  // Boot modem
+  analogReadResolution(12);
+  analogSetPinAttenuation(BAT_ADC, ADC_11db);
+
+  setupWatchdog();
+
+  setLED(LED_RED1, true);
+  setLED(LED_RED2, true);
+  delay(1000);
+  setLED(LED_RED1, false);
+  setLED(LED_RED2, false);
+
   powerOnModem();
   modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-  delay(1000);
+  delayWithTasks(1000);
 
   if (!waitForModem()) {
-    Serial.println("Modem dead — restarting!");
+    LOGLN("Modem dead — restarting!");
     ESP.restart();
   }
-  esp_task_wdt_reset();
 
   modem.init();
-  Serial.print("Modem: ");
-  Serial.println(modem.getModemInfo());
-  esp_task_wdt_reset();
+  LOG("Modem: "); LOGLN(modem.getModemInfo());
 
-  // Network
-  Serial.print("Network");
-  int ntries = 0;
-  while (!modem.waitForNetwork(10000L)) {
-    Serial.print(".");
-    blinkLED(2);
-    esp_task_wdt_reset();
-    if (++ntries > 18) {
-      Serial.println(" timeout — restarting!");
-      ESP.restart();
-    }
-  }
-  Serial.println(" OK");
-  Serial.print("Operator: ");
-  Serial.println(modem.getOperator());
-  Serial.print("Signal:   ");
-  Serial.println(modem.getSignalQuality());
-  esp_task_wdt_reset();
-
-  // 4G data
-  Serial.print("APN...");
-  if (!modem.gprsConnect(APN, USER, PASS)) {
-    Serial.println(" FAILED — restarting!");
+  if (!connect4G()) {
+    LOGLN("4G failed — restarting!");
     ESP.restart();
   }
-  Serial.print(" OK  IP: ");
-  Serial.println(modem.localIP());
-  esp_task_wdt_reset();
 
-  // GPS setup
-  setupGPS();
+  setupGNSS();
 
-  digitalWrite(LED_PIN, LOW);
-  Serial.println("\n=== Ready ===\n");
-  esp_task_wdt_reset();
-}
+  gpsSearchStarted = true;
+  hasGPSFix = false;
+  updateLEDs();
 
-// ============================================================
-void setupGPS() {
-  Serial.println("Configuring GPS...");
-
-  // GPS(1) + GLONASS(2) + Galileo(8) = 11 — optimal for Finland
-  sendATCmd("AT+CGNSSMODE=11", 1000);
-
-  // Enable GPS
-  modem.enableGPS();
-  delay(1000);
-
-  // Download AGPS data over 4G — cuts cold start from 2min to ~10s
-  Serial.println("Downloading AGPS data (10s)...");
-  sendATCmd("AT+AGPS", 12000);
-  Serial.println("AGPS done!");
+  LOGLN("Ready — searching GNSS fix.");
 }
 
 // ============================================================
 void loop() {
   esp_task_wdt_reset();
-  digitalWrite(LED_PIN, HIGH);
+  updateLEDs();
 
-  // GPS variables
-  float lat = 0, lon = 0, spd = 0, alt = 0, acc = 0;
-  int   vsat = 0, usat = 0;
-  int   yr = 0, mo = 0, dy = 0, hr = 0, mi = 0, sc = 0;
-  bool  gotFix = false;
+  GpsFix fix;
+  bool gotFix = false;
+  unsigned long start = millis();
+  unsigned long lastPrint = 0;
 
-  // Poll for GPS fix
-  Serial.print("GPS");
-  unsigned long t0 = millis();
-
-  while (millis() - t0 < GPS_TIMEOUT_MS) {
+  while (millis() - start < GPS_SEARCH_TIMEOUT_MS) {
     esp_task_wdt_reset();
+    updateLEDs();
 
-    if (modem.getGPS(&lat, &lon, &spd, &alt,
-                     &vsat, &usat, &acc,
-                     &yr, &mo, &dy,
-                     &hr, &mi, &sc)) {
-
-      // Sanity check — must be valid Finland coordinates
-      if (lat > 59.0 && lat < 71.0 &&
-          lon > 19.0 && lon < 32.0) {
-        gotFix = true;
-        break;
-      }
+    if (readGpsFix(fix)) {
+      gotFix = true;
+      hasGPSFix = true;
+      updateLEDs();
+      break;
     }
 
-    delay(GPS_POLL_MS);
+    delayWithTasks(GPS_POLL_MS);
 
-    // Progress every 5 seconds
-    if ((millis() - t0) % 5000 < GPS_POLL_MS + 100) {
-      Serial.printf("..%lus", (millis() - t0) / 1000);
+    unsigned long elapsed = millis() - start;
+    if (elapsed - lastPrint >= 10000) {
+      lastPrint = elapsed;
+      LOG("Searching GNSS... "); LOG(elapsed / 1000); LOGLN("s");
     }
   }
 
-  // ---- Got GPS fix ----------------------------------------
-  if (gotFix) {
-    Serial.println(" FIX!");
-    Serial.printf("  Lat:  %.6f\n",      lat);
-    Serial.printf("  Lon:  %.6f\n",      lon);
-    Serial.printf("  Alt:  %.1f m\n",    alt);
-    Serial.printf("  Spd:  %.2f km/h\n", spd);
-    Serial.printf("  Sats: %d/%d\n",     usat, vsat);
-    Serial.printf("  Acc:  %.1f m\n",    acc);
-    Serial.printf("  Time: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
-                  yr, mo, dy, hr, mi, sc);
+  if (!gotFix) {
+    hasGPSFix = false;
+    updateLEDs();
+    LOGLN("No GNSS fix in this window.");
+    delayWithTasks(1000);
+    return;
+  }
 
-    float batt = readBattery();
-    Serial.printf("  Batt: %.0f%%\n", batt);
+  LOGF("GPS FIX lat=%.6f lon=%.6f speed=%.2f km/h sats=%d/%d acc=%.1f\n",
+       fix.lat, fix.lon, fix.speedKmh, fix.usedSats, fix.visibleSats, fix.accuracy);
 
-    char ts[32];
-    snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             yr, mo, dy, hr, mi, sc);
+  unsigned long interval = fix.speedKmh >= RUN_THRESHOLD_KMH ? RUN_INTERVAL_MS : WALK_INTERVAL_MS;
+  if (interval < MIN_SEND_INTERVAL_MS) interval = MIN_SEND_INTERVAL_MS;
 
-    bool sent = sendToTraccar(lat, lon, spd, alt,
-                               usat, batt, ts, false);
-    if (sent) {
+  unsigned long now = millis();
+  if (now - lastSendMs >= interval) {
+    if (sendToTraccar(fix)) {
       failCount = 0;
-      blinkLED(1);
+      lastSendMs = now;
     } else {
       failCount++;
-      blinkLED(5);
       if (failCount >= 5) {
-        Serial.println("5 failures — reconnecting GPRS...");
+        LOGLN("Too many send failures; reconnecting GPRS.");
         modem.gprsDisconnect();
-        delay(2000);
-        modem.gprsConnect(APN, USER, PASS);
+        has4G = false;
+        updateLEDs();
+        delayWithTasks(2000);
+        has4G = modem.gprsConnect(APN, APN_USER, APN_PASS);
+        updateLEDs();
         failCount = 0;
       }
     }
-
-  // ---- No GPS fix — try cell tower fallback ---------------
-  } else {
-    Serial.println(" no fix");
-    tryLBSFallback();
   }
 
-  digitalWrite(LED_PIN, LOW);
-
-  // Adaptive rate: walk or run
-  unsigned long interval;
-  if (spd >= SPEED_THRESHOLD_KMH) {
-    interval = INTERVAL_RUN_MS;
-    Serial.println("Mode: RUN (1s)");
-  } else {
-    interval = INTERVAL_WALK_MS;
-    Serial.println("Mode: WALK (5s)");
-  }
-
-  Serial.printf("Signal: %d | Next in %lus\n\n",
-                modem.getSignalQuality(), interval / 1000);
-
-  sleepWithWatchdog(interval);
-}
-
-// ============================================================
-bool sendToTraccar(float lat, float lon, float spd,
-                   float alt, int sats, float batt,
-                   const char* ts, bool isLBS) {
-  Serial.print("Traccar...");
-
-  if (!modem.isGprsConnected()) {
-    Serial.print("(reconnect) ");
-    modem.gprsConnect(APN, USER, PASS);
-    delay(3000);
-  }
-
-  String path = "/?id=";      path += DEVICE_ID;
-  path += "&lat=";             path += String(lat, 6);
-  path += "&lon=";             path += String(lon, 6);
-  path += "&speed=";           path += String(spd, 2);
-  path += "&altitude=";        path += String(alt, 1);
-  path += "&batt=";            path += String(batt, 0);
-  path += "&satellites=";      path += String(sats);
-  path += "&accuracy=";        path += String(isLBS ? 500 : 5);
-  if (strlen(ts) > 0) {
-    path += "&timestamp=";     path += ts;
-  }
-
-  HttpClient http(gsmClient, TRACCAR_HOST, TRACCAR_PORT);
-  http.setTimeout(15000);
-  int err = http.get(path);
-
-  if (err == 0) {
-    int status = http.responseStatusCode();
-    Serial.printf(" HTTP %d\n", status);
-    http.stop();
-    return (status == 200);
-  }
-
-  Serial.printf(" err %d\n", err);
-  http.stop();
-  return false;
-}
-
-// ============================================================
-void tryLBSFallback() {
-  Serial.print("LBS...");
-  while (modemSerial.available()) modemSerial.read();
-  modemSerial.println("AT+CLBS=1,1");
-
-  String resp = "";
-  unsigned long t = millis();
-  while (millis() - t < 6000) {
-    if (modemSerial.available())
-      resp += (char)modemSerial.read();
-  }
-
-  if (resp.indexOf("+CLBS: 0") >= 0) {
-    int s1   = resp.indexOf("+CLBS: 0,") + 9;
-    float la = resp.substring(s1).toFloat();
-    int s2   = resp.indexOf(',', s1) + 1;
-    float lo = resp.substring(s2).toFloat();
-    if (la != 0 && lo != 0) {
-      Serial.printf(" %.4f, %.4f\n", la, lo);
-      float batt = readBattery();
-      sendToTraccar(la, lo, 0, 0, 0, batt, "", true);
-    }
-  } else {
-    Serial.println(" failed");
-  }
-}
-
-// ============================================================
-float readBattery() {
-  // 20 samples, average middle 10 to remove outliers
-  int r[20];
-  for (int i = 0; i < 20; i++) { r[i] = analogRead(BAT_ADC); delay(5); }
-  for (int i = 0; i < 19; i++)
-    for (int j = i+1; j < 20; j++)
-      if (r[j] < r[i]) { int t = r[i]; r[i] = r[j]; r[j] = t; }
-  long sum = 0;
-  for (int i = 5; i < 15; i++) sum += r[i];
-  float voltage = (sum / 10.0 / 4095.0) * 3.3 * 2.0;
-  return constrain(((voltage - 3.0) / (4.2 - 3.0)) * 100.0, 0.0, 100.0);
-}
-
-// ============================================================
-void sleepWithWatchdog(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {
-    esp_task_wdt_reset();
-    delay(500);
-  }
-}
-
-// ============================================================
-void sendATCmd(const char* cmd, int waitMs) {
-  while (modemSerial.available()) modemSerial.read();
-  modemSerial.println(cmd);
-  delay(waitMs);
-  while (modemSerial.available()) modemSerial.read();
-}
-
-// ============================================================
-bool waitForModem() {
-  Serial.print("Sync modem");
-  for (int i = 0; i < 20; i++) {
-    while (modemSerial.available()) modemSerial.read();
-    modemSerial.println("AT");
-    delay(500);
-    String resp = "";
-    unsigned long t = millis();
-    while (millis() - t < 500)
-      if (modemSerial.available())
-        resp += (char)modemSerial.read();
-    if (resp.indexOf("OK") >= 0) {
-      Serial.println(" OK!");
-      return true;
-    }
-    Serial.print(".");
-    esp_task_wdt_reset();
-  }
-  Serial.println(" FAILED");
-  return false;
-}
-
-// ============================================================
-void powerOnModem() {
-  Serial.println("Powering on modem...");
-  pinMode(MODEM_PWRKEY,   OUTPUT);
-  pinMode(MODEM_POWER_ON, OUTPUT);
-  pinMode(MODEM_RST,      OUTPUT);
-  digitalWrite(MODEM_POWER_ON, HIGH);
-  digitalWrite(MODEM_RST, HIGH);
-  delay(100);
-  digitalWrite(MODEM_PWRKEY, HIGH);
-  delay(1200);
-  digitalWrite(MODEM_PWRKEY, LOW);
-  delay(8000);
-  Serial.println("Modem up!");
-}
-
-// ============================================================
-void blinkLED(int n) {
-  for (int i = 0; i < n; i++) {
-    digitalWrite(LED_PIN, HIGH); delay(150);
-    digitalWrite(LED_PIN, LOW);  delay(150);
-  }
+  delayWithTasks(200);
 }

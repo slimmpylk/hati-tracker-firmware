@@ -1,22 +1,44 @@
 # 🐾 Hati Tracker Firmware
 
-GPS tracker firmware for the **LilyGO T-A7670E** ESP32 board.
-Built for tracking a dog (Hati, an Australian Cattle Dog) during canicross runs.
+Firmware for a DIY 4G GNSS tracker built on the **LilyGO T-A7670E / SIMCom A7670E** board.
 
-Live location is sent to a [Traccar](https://traccar.org) server via 4G over Telia Finland.
+The tracker was built for following Hati, an Australian Cattle Dog, during canicross runs. It sends live position data to a private [Traccar](https://traccar.org) server using the OsmAnd HTTP protocol over 4G.
+
+---
+
+## Current Status
+
+Working end-to-end:
+
+- Telia Finland 4G connection
+- A7670E GNSS power-up and ready detection
+- AGPS assistance download with `AT+CAGPS`
+- Manual `AT+CGNSSINFO` parsing for latitude, longitude, speed, altitude, time and satellite data
+- Traccar OsmAnd HTTP upload
+- Adaptive update rate based on speed
+- Watchdog protection
+- Two-LED status indication
+
+Important implementation note: this firmware does **not** use `TinyGSM::getGPS()`. On this A7670E firmware, TinyGSM's SIM7600 GPS parser returned invalid coordinates, while raw `AT+CGNSSINFO` returned valid fixes. The firmware therefore parses `AT+CGNSSINFO` directly.
 
 ---
 
 ## Features
 
-- **Live GPS tracking** — position, speed, altitude, satellite count
-- **4G LTE** via Telia Finland (APN: `internet`)
-- **Cell tower LBS fallback** — approximate position when GPS has no fix (indoors, dense forest)
-- **Adaptive update rate** — every 10 seconds when moving, every 60 seconds when still
-- **Battery monitoring** — voltage sent with every position update
-- **GPS timestamps** — accurate UTC time sent to Traccar
-- **Watchdog timer** — board auto-restarts if firmware hangs
-- **LED status indicator** — single blink = OK, 5 blinks = error
+- **Live GNSS tracking** — latitude, longitude, speed, altitude, timestamp, satellite count and estimated accuracy
+- **4G LTE upload** — tested with Telia Finland APN `internet`
+- **Private Traccar support** — server details are stored in `secrets.h`, not committed to Git
+- **AGPS support** — uses `AT+CAGPS`, which significantly improves first-fix time on the tested A7670E
+- **Adaptive send interval**
+  - Walking / slow movement: every 5 seconds
+  - Running / fast movement: every 1 second
+- **OsmAnd protocol upload** — sends positions to Traccar port `5055`
+- **Two LED status indicators**
+  - RED1 solid = 4G connected
+  - RED2 solid = GNSS fix active
+  - Both solid = tracker is fully working
+- **Watchdog timer** — restarts the board if the firmware hangs
+- **Battery placeholder** — battery ADC is disabled by default until the correct board ADC calibration is verified
 
 ---
 
@@ -24,115 +46,235 @@ Live location is sent to a [Traccar](https://traccar.org) server via 4G over Tel
 
 | Component | Details |
 |---|---|
-| Board | LilyGO T-A7670E R2 (with GPS) |
-| Modem | SIMCOM A7670E — 4G LTE Cat1, Europe bands |
-| GPS | Built-in GNSS on A7670E module |
-| Battery | 18650 Li-ion in onboard holder |
-| SIM | Nano SIM (Telia Finland 200MB) |
+| Board | LilyGO T-A7670E R2 |
+| Modem | SIMCom A7670E / A7670E-FASE |
+| MCU | ESP32 |
+| Cellular | 4G LTE Cat-1 |
+| SIM | Nano SIM, tested with Telia Finland |
+| GNSS antenna | External L1/L5 antenna; A7670E appears to use L1 |
+| Battery | 18650 Li-ion in onboard holder, not yet ADC-calibrated |
+| Use case | Canicross / dog tracking |
 
-### Pin Definitions
+---
+
+## Pin Definitions
 
 | Pin | GPIO | Function |
-|---|---|---|
-| Modem TX | 26 | ESP32 → A7670E |
-| Modem RX | 27 | A7670E → ESP32 |
-| PWRKEY | 4 | Modem power toggle |
-| POWER_ON | 25 | Modem power rail |
-| RST | 5 | Modem reset |
-| BAT_ADC | 35 | Battery voltage ADC |
-| LED | 12 | Status LED |
+|---|---:|---|
+| MODEM_TX | 26 | ESP32 TX → modem RX |
+| MODEM_RX | 27 | ESP32 RX ← modem TX |
+| MODEM_PWRKEY | 4 | Modem power key |
+| MODEM_POWER_ON | 25 | Modem power rail |
+| MODEM_RST | 5 | Modem reset |
+| BAT_ADC | 35 | Battery ADC, disabled by default |
+| LED_RED1 | 12 | 4G status |
+| LED_RED2 | 2 | GNSS status |
 
 ---
 
 ## Dependencies
 
-Install via Arduino IDE Library Manager:
+Install these with the Arduino IDE Library Manager:
 
-| Library | Version | Purpose |
-|---|---|---|
-| `TinyGSM` | latest | Modem AT command interface |
-| `ArduinoHttpClient` | latest | HTTP requests to Traccar |
+| Library | Purpose |
+|---|---|
+| `TinyGSM` | Modem/network interface |
+| `ArduinoHttpClient` | HTTP upload to Traccar |
 
-> **Note:** Use the standard TinyGSM with `#define TINY_GSM_MODEM_SIM7600` —
-> the A7670E is AT-command compatible with SIM7600.
+The code currently uses:
+
+```cpp
+#define TINY_GSM_MODEM_SIM7600
+```
+
+This works for the cellular side of the tested A7670E. GNSS is handled manually through AT commands because TinyGSM GPS parsing was not compatible with the tested modem firmware.
 
 ---
 
-## Setup
+## Arduino IDE Setup
 
-### 1. Arduino IDE Configuration
+Recommended settings used during testing:
 
-- Board: `ESP32 Wrover Module`
-- Upload speed: `921600`
-- Flash size: `16MB`
-- Partition scheme: `Huge APP`
-- Port: `/dev/ttyACM0` (Linux) or `COM3` (Windows)
+| Setting | Value |
+|---|---|
+| Board | ESP32 Wrover Module |
+| Upload speed | 921600 |
+| Flash size | 16MB |
+| Partition scheme | Huge APP |
+| Serial baud | 115200 |
+| Linux port example | `/dev/ttyACM0` |
 
-### 2. Configuration
+For serial logging on Linux:
 
-Edit these values at the top of `hati_tracker.ino`:
-
-```cpp
-// Traccar server — change to your own server
-const char TRACCAR_HOST[] = "demo.traccar.org";
-const int  TRACCAR_PORT   = 5055;
-const char DEVICE_ID[]    = "hati-tracker-001";
-
-// Carrier APN — change if not Telia Finland
-const char APN[] = "internet";
+```bash
+picocom -b 115200 /dev/ttyACM0 | tee -a gps_log.txt
 ```
 
-### 3. Traccar Setup
+Exit picocom with:
 
-1. Register at [demo.traccar.org](https://demo.traccar.org) (for testing)
-   or set up your own server (see `hati-tracker-backend`)
-2. Add a new device with identifier: `hati-tracker-001`
-3. Protocol: **OsmAnd** (port 5055)
+```text
+Ctrl+A
+Ctrl+X
+```
+
+---
+
+## Private Configuration
+
+Create a file named:
+
+```text
+secrets.h
+```
+
+Place it in the same folder as the `.ino` file.
+
+Example real `secrets.h`:
+
+```cpp
+#pragma once
+
+const char APN[]       = "internet";
+const char APN_USER[]  = "";
+const char APN_PASS[]  = "";
+
+const char TRACCAR_HOST[] = "your.traccar.server.com";
+const int  TRACCAR_PORT   = 5055;
+const char DEVICE_ID[]    = "hati-tracker-001";
+```
+
+Do **not** commit `secrets.h`.
+
+Commit this as `secrets.example.h` instead:
+
+```cpp
+#pragma once
+
+const char APN[]       = "internet";
+const char APN_USER[]  = "";
+const char APN_PASS[]  = "";
+
+const char TRACCAR_HOST[] = "example.traccar.server.com";
+const int  TRACCAR_PORT   = 5055;
+const char DEVICE_ID[]    = "example-device-id";
+```
+
+Recommended `.gitignore`:
+
+```gitignore
+secrets.h
+*.log
+gps_log*.txt
+```
+
+Do not commit serial logs containing modem identifiers such as IMEI.
+
+---
+
+## Traccar Setup
+
+This firmware sends positions using Traccar's OsmAnd HTTP protocol.
+
+Minimum server setup:
+
+1. Run your own Traccar server, preferably on a private VPS.
+2. Expose Traccar web UI/API port, usually `8082`.
+3. Expose OsmAnd receiver port `5055`.
+4. Create a device in Traccar.
+5. Set the device unique ID to match `DEVICE_ID` in `secrets.h`.
+6. Set `TRACCAR_HOST` in `secrets.h` to your VPS IP address or domain.
+7. Upload the firmware and verify `Traccar HTTP 200` in serial logs.
+
+The public Traccar demo server should only be used for quick testing, not real tracking.
 
 ---
 
 ## How It Works
 
-```
+```text
 Boot
- └─ Power on A7670E modem (1200ms PWRKEY pulse + 8s wait)
- └─ Sync AT communication
- └─ Connect to Telia 4G (APN: internet)
- └─ Enable GPS
+ ├─ Start watchdog
+ ├─ Power on A7670E modem
+ ├─ Sync AT communication
+ ├─ Connect to cellular network
+ ├─ Connect APN / GPRS data
+ ├─ Power on GNSS with AT+CGNSSPWR=1
+ ├─ Wait for +CGNSSPWR: READY!
+ ├─ Download AGPS assistance with AT+CAGPS
+ └─ Start tracking loop
 
-Loop every 10s (moving) / 60s (still):
- └─ Try GPS fix (up to 2 min timeout)
-     ├─ Got fix → send lat/lon/speed/alt/battery/timestamp to Traccar
-     └─ No fix  → try LBS cell tower fallback → send approximate position
-
-Watchdog: auto-restart if board hangs > 2 minutes
+Tracking loop
+ ├─ Poll AT+CGNSSINFO
+ ├─ Parse valid GNSS fix
+ ├─ Choose send interval based on speed
+ ├─ Send position to Traccar
+ └─ Keep LEDs updated
 ```
 
 ---
 
 ## LED Status
 
-| Pattern | Meaning |
-|---|---|
-| Solid ON | Booting |
-| 1 blink | Position sent successfully |
-| 2 blinks | Waiting for network |
-| 5 blinks | Send failed |
+| LED | State | Meaning |
+|---|---|---|
+| RED1 | Blinking | Booting or connecting 4G |
+| RED1 | Solid ON | 4G data connected |
+| RED2 | OFF | GNSS search not started |
+| RED2 | Blinking | Searching for GNSS fix |
+| RED2 | Solid ON | Valid GNSS fix active |
+| RED1 + RED2 | Both solid ON | Tracker is fully working |
 
 ---
 
-## Battery Life Estimates
+## Data Sent to Traccar
 
-| Update rate | Battery (2500mAh 18650) |
-|---|---|
-| Every 10s (active run) | ~6–8 hours |
-| Every 60s (idle/still) | ~24–36 hours |
-| Mixed use typical day | ~12–16 hours |
+Each valid fix sends:
+
+- Device ID
+- Latitude
+- Longitude
+- Speed
+- Altitude
+- Battery percentage
+- Satellite count
+- Accuracy estimate
+- Valid flag
+- GNSS UTC timestamp
+
+Speed from `AT+CGNSSINFO` appears to be km/h in the train test. The firmware converts it to knots before sending because Traccar's OsmAnd protocol commonly interprets speed as knots.
+
+---
+
+## Notes and Limitations
+
+- `AT+CGNSSMODE=11` returned `ERROR` on the tested firmware, so the code does not force a constellation mode.
+- `AT+AGPS` returned `ERROR`; `AT+CAGPS` worked and returned `+AGPS: success`.
+- Battery ADC is disabled by default because USB-only testing showed `0.00V`. Calibrate the ADC with a battery and multimeter before enabling it.
+- GNSS altitude can be noisy. Dashboard/backend analytics should smooth elevation before calculating elevation gain.
+- LBS fallback is intentionally not included in the clean firmware because inaccurate cell-tower points can damage sports-session statistics.
+
+---
+
+## Project Structure
+
+```text
+hati_tracker/
+├── hati_tracker.ino
+├── secrets.h              # private, not committed
+├── secrets.example.h      # committed template
+├── README.md
+└── .gitignore
+```
 
 ---
 
 ## Related Repositories
 
-- [`hati-tracker-backend`](https://github.com/yourusername/hati-tracker-backend) — Traccar server on Docker
-- [`hati-tracker-dashboard`](https://github.com/yourusername/hati-tracker-dashboard) — React/TypeScript canicross stats dashboard
+- `hati-tracker-backend` — private Traccar server on Docker
+- `hati-tracker-dashboard` — future React/TypeScript canicross stats dashboard
 
+---
+
+## License
+
+MIT, unless changed later.
